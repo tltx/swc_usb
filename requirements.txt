@@ -1,0 +1,2 @@
+pyserial >= 3.0.1
+click >= 6.2
