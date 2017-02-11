@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 from collections import namedtuple
+from io import BytesIO
 from time import sleep, time
 
 import serial
@@ -9,6 +10,8 @@ from struct import pack, unpack_from
 
 BLOCK_SIZE = 8192
 SWC_HEADER_SIZE = 512
+LO_ROM = 'lo_rom'
+HI_ROM = 'hi_rom'
 
 
 def detect_com_port():
@@ -38,7 +41,7 @@ def check_feedback(ser, feedback, wait_ok=0):
         if b'OK' in feedback:
             break
         elif b'TIMEOUT' in feedback:
-            raise click.ClickException('Transfer timeout, is the USB adapter connected to the Super Wild Card?')
+            raise click.ClickException('Transfer timeout, is the USB adapter connected to the Super Wild Card? Power cycle the SNES might fix this.')
         elif b'UNKNOWN COMMAND' in feedback:
             raise click.ClickException('Transfer failed!')
         if wait_ok > 0:
@@ -60,18 +63,24 @@ def main(ctx, com_port):
 
 
 @main.command(name='send-rom')
-@click.option('--hirom/--lorom', default=None, help="Run the ROM in hiROM or loROM mode.")
-@click.option('--sram-size', default=None, help="Set SRAM size for ROM in Kibibytes e.g. --sram-size=8")
+@click.option('--hirom/--lorom', default=None, help="Run the ROM in HiROM or LoROM mode.")
+@click.option('--sram-size',  type=click.Choice(['0', '16', '64']), default=None, help="Set SRAM size for ROM in Kibit e.g. --sram-size=64")
 @click.argument('rom_file', type=click.File('rb'))
 @click.pass_obj
 def send_rom(ctx, hirom, sram_size, rom_file):
     """Send a ROM file to the Super Wild Card."""
     rom = rom_file.read()
-    header, rom = separate_swc_header(rom)
-    emu_bit = adjust_header_emu_bit(header.emulation) if header else 0x00
-    emu_bit = emulation_mode_select(emu_bit, hirom, sram_size)
+    _, rom = separate_swc_header(rom)
+    rom_type, snes_header_sram_size = determine_rom_type_and_sram_size(rom)
+    if hirom is not None:
+        rom_type = HI_ROM if hirom else LO_ROM
+    if sram_size:
+        emu_byte_sram_size = (int(sram_size) * 1024) // 8
+    else:
+        emu_byte_sram_size = snes_header_sram_size
+    emu_byte = emulation_mode_select(rom_type=rom_type, sram_size=emu_byte_sram_size)
     blocks = len(rom) // BLOCK_SIZE
-    command = pack('>10sxHB', b'WRITE ROM', blocks, emu_bit)
+    command = pack('>10sxHB', b'WRITE ROM', blocks, emu_byte)
     send(ctx['com_port'], command, rom)
 
 
@@ -95,38 +104,37 @@ def fetch_sram(ctx, sram_file):
     with serial.Serial(ctx['com_port'], timeout=3) as ser:
         start_time = time()
         ser.write(pack('>10sx', b'READ SRAM'))
-        sram = bytearray()
+        sram = BytesIO()
         with click.progressbar(range(0, BLOCK_SIZE * 4), label='Receiving') as all_bytes:
             for _ in all_bytes:
                 byte = ser.read(size=1)
                 if byte == b'':
                     raise click.ClickException('Transfer timeout.')
-                sram.append(byte)
+                sram.write(byte)
         trail = ser.read(size=9)
-        if trail != '*#*#*#*OK':
+        if trail != b'*#*#*#*OK':
             raise click.ClickException('Transfer failed! ({})'.format(trail))
-        sram_file.write(sram)
+        sram_file.write(sram.getbuffer())
         click.echo(click.style('Transfer complete in {0:.2f} seconds.'.format(time() - start_time), fg='green'))
 
 
-def emulation_mode_select(emu_bit, hirom, sram_size):
-    if hirom is not None:
-        emu_bit = emu_bit | 0x30 if hirom else emu_bit & ~0x30
+def emulation_mode_select(rom_type, sram_size):
+    emu_byte = 0x00
+    if rom_type == HI_ROM:
+        emu_byte |= 0x30
 
     bits_by_sram_size = {
-        # bit 3 & 2 are already ok for 32 KiB SRAM size
-        8: 0x04,
-        2: 0x08,
+        8192: 0x04,
+        2048: 0x08,
         0: 0x0C,
     }
-    if sram_size is not None:
-        sram_bit_mask = 0xF3
-        emu_bit = (emu_bit & sram_bit_mask) | bits_by_sram_size.get(sram_size, 0x00)
-    return emu_bit
+
+    emu_byte |= bits_by_sram_size.get(sram_size, 0x00)
+    return emu_byte
 
 
 def separate_swc_header(rom):
-    swc_header = namedtuple('SwcHeader', ('emulation', 'id1', 'id2', 'type'))(*unpack_from('2xB5xBBB', rom))
+    swc_header = namedtuple('SwcHeader', ('emulation', 'id1', 'id2', 'type'))(*unpack_from('2xB5x3B', rom))
     if (
         swc_header.id1 == 0xAA and
         swc_header.id2 == 0xBB and
@@ -138,12 +146,71 @@ def separate_swc_header(rom):
         return None, rom
 
 
-def adjust_header_emu_bit(emu_bit):
-    # 0x0c == no SRAM & LoROM; we use the header, so that the user can override this
-    # bit 4 == 0 => DRAM mode 20 (LoROM); disable SRAM by setting SRAM mem map mode 2
-    if emu_bit & 0x1C == 0x0C:
-        emu_bit |= 0x20
-    return emu_bit
+def determine_rom_type_and_sram_size(rom):
+    lo_header = parse_header(rom[0x7FC0:0x7FFF])
+    hi_header = parse_header(rom[0xFFC0:0xFFFF])
+    rom_size = len(rom)
+    lo_rom_rank = rank_header(header=lo_header, expected_rom_type=LO_ROM, rom_size=rom_size)
+    hi_rom_rank = rank_header(header=hi_header, expected_rom_type=HI_ROM, rom_size=rom_size)
+
+    if hi_rom_rank > lo_rom_rank:
+        return HI_ROM, snes_header_size_in_bytes(hi_header.sram_size)
+    else:
+        return LO_ROM, snes_header_size_in_bytes(lo_header.sram_size)
+
+
+def rank_header(header, expected_rom_type, rom_size):
+    rank = 0
+    markup_bytes = {
+        LO_ROM: [0x20, 0x30, 0x32],
+        HI_ROM: [0x21, 0x31, 0x35],
+    }
+    sram_sizes = [2048, 4096, 8192]
+
+    if header.rom_makeup_byte in markup_bytes[expected_rom_type]:
+        rank += 1
+
+    if all(0x1F < byte < 0x7F for byte in header.game_title):
+        rank += 1
+
+    if snes_header_size_in_bytes(header.rom_size) == rom_size:
+        rank += 1
+
+    if snes_header_size_in_bytes(header.sram_size) in sram_sizes:
+        rank += 1
+
+    if header.country < 14:
+        rank += 1
+
+    if header.checksum ^ header.checksum_complement == 0xFFFF:
+        rank += 1
+    return rank
+
+
+def snes_header_size_in_bytes(size_byte):
+    if size_byte == 0:
+        return 0
+    else:
+        return 0x400 << size_byte
+
+
+def parse_header(header_bytes):
+    header = namedtuple(
+        'SnesHeader',
+        (
+            'game_title',
+            'rom_makeup_byte',
+            'rom_type',
+            'rom_size',
+            'sram_size',
+            'country',
+            'license',
+            'version',
+            'checksum_complement',
+            'checksum',
+        )
+    )(*unpack_from('21s7B2H', header_bytes[:32]))
+    return header
 
 
 if __name__ == '__main__':
