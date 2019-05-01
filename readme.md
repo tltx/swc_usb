@@ -45,7 +45,11 @@ A: swc_usb.hex is a compiled firmware ready to be loaded onto the controller. If
 
 Q: Does it have all the swc transfer features that Ucon64 has?
 
-A: No, It can send ROM files, send SRAM, fetch SRAM. If there is interest in some other feature I might add it.  
+A: No, It can send ROM files, send SRAM, fetch SRAM. If there is interest in some other feature I might add it.
+
+Q: Which variants of the Super Wild Card is supported?
+
+A: I think it works on all but I have tested it on: Super Magicom (MS-3201), Super Wild Card (SMS3201), Super Wild Card DX (SWC3201)
 
 
 Atmega32u4 pin mapping to the D-Sub
